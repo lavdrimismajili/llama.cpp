@@ -84,6 +84,7 @@
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
+#include "batched_mmq_ternary.hpp"
 
 #define MEM_SIZE_2M	0x00200000
 #define MEM_SIZE_1G	0x40000000
@@ -976,6 +977,7 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
 }
 
 static bool ggml_sycl_device_has_dpas16(int device);
+static bool ggml_sycl_device_has_dpas(int device);
 
 // GGML_SYCL_DISABLE_XMX=1 keeps PQ2_0/PTQ1_0 off the XMX path (and its layout)
 static bool ggml_sycl_xmx_disabled() {
@@ -988,7 +990,7 @@ static bool ggml_sycl_xmx_disabled() {
 static bool ggml_sycl_ptq1_xmx_expands(int device, const ggml_tensor * tensor) {
     return tensor->type == GGML_TYPE_PTQ1_0 && g_ggml_sycl_enable_optimize && !ggml_sycl_xmx_disabled() &&
            tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_sycl_pq2_xmx_supports_ne0(tensor->ne[0]) &&
-           ggml_sycl_device_has_dpas16(device);
+           ggml_sycl_device_has_dpas(device);
 }
 
 static size_t ggml_sycl_ptq1_xmx_bytes(const ggml_tensor * tensor) {
@@ -3815,6 +3817,12 @@ static bool ggml_sycl_device_has_dpas16(int device) {
     return ggml_sycl_info().devices[device].dpas_exec_size == 16;
 }
 
+// 8-wide DPAS path is available for PQ2_0/PTQ1_0 too; the kernel dispatches on width internally.
+static bool ggml_sycl_device_has_dpas(int device) {
+    const int w = ggml_sycl_info().devices[device].dpas_exec_size;
+    return w == 8 || w == 16;
+}
+
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -4596,7 +4604,7 @@ static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_te
     if (extra && extra->optimized_feature.xmx_pq2) {
         return true;
     }
-    if (!g_ggml_sycl_enable_optimize || ggml_sycl_xmx_disabled() || !ggml_sycl_device_has_dpas16(ctx.device)) {
+    if (!g_ggml_sycl_enable_optimize || ggml_sycl_xmx_disabled() || !ggml_sycl_device_has_dpas(ctx.device)) {
         return false;
     }
     // op offload refills COMPUTE buffers from host memory every time, so an in-place layout there goes stale
@@ -4626,7 +4634,6 @@ static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_te
 
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
-
     // Handle HADAMARAD hint given from further up the pipeline and pass it to the correct
     // kernel.
     //
@@ -4679,6 +4686,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 #ifdef SYCL_USE_XMX
     use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif // SYCL_USE_XMX
+    if ((src0->type == GGML_TYPE_PTQ1_0 || src0->type == GGML_TYPE_PQ2_0) &&
+    src1->ne[1] > 8 &&
+    src0->ne[2] == 1 && src0->ne[3] == 1 &&
+    src1->ne[2] == 1 && src1->ne[3] == 1) {
+    ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_batched_ternary);
+    return;
+}
 
     // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For
     // best performance use ESIMD when supported, followed by MMVQ, and finally DMMV.

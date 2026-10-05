@@ -216,21 +216,27 @@ if (GGML_SYCL_DEVICE_ARCH)
         -fsycl-max-parallel-link-jobs=${GGML_SYCL_MAX_PARALLEL_LINK_JOBS}
     )
 
-    # The PQ2_0/PTQ1_0 XMX kernels (pq2_xmx.cpp) need 16-wide DPAS and 2D block loads, and AOT compiles them for
-    # every listed device, so they are only built when all of them are Xe-HPC, Xe2 or later. Otherwise those
-    # types keep the existing paths.
+        # PQ2_0/PTQ1_0 XMX kernels support both 16-wide and 8-wide DPAS.
+    # 16-wide: Xe-HPC (not -vg), Xe2, Xe3.
+    # 8-wide:  Alchemist (acm, ats), Arrow Lake-H (arl), and the same 16-wide set as a superset.
+    # Devices without XMX at all keep the existing fallback paths.
     string(REPLACE "," ";" _ggml_sycl_aot_devices "${GGML_SYCL_DEVICE_ARCH}")
-    set(_ggml_sycl_pq2_xmx ON)
+    set(_ggml_sycl_pq2_xmx_16 ON)
+    set(_ggml_sycl_pq2_xmx_8  ON)
     foreach (_ggml_sycl_dev IN LISTS _ggml_sycl_aot_devices)
         string(STRIP "${_ggml_sycl_dev}" _ggml_sycl_dev)
         string(TOLOWER "${_ggml_sycl_dev}" _ggml_sycl_dev)
-        # the -vg parts of Xe-HPC have no XMX
         if (NOT _ggml_sycl_dev MATCHES "^(pvc|bmg|lnl|ptl|wcl|nvl|cri|xe-hpc|xe2|xe3)" OR _ggml_sycl_dev MATCHES "-vg")
-            set(_ggml_sycl_pq2_xmx OFF)
+            set(_ggml_sycl_pq2_xmx_16 OFF)
+        endif()
+        if (NOT _ggml_sycl_dev MATCHES "^(acm|ats|arl|pvc|bmg|lnl|ptl|wcl|nvl|cri|xe-hpc|xe2|xe3)" OR _ggml_sycl_dev MATCHES "-vg")
+            set(_ggml_sycl_pq2_xmx_8 OFF)
         endif()
     endforeach()
-    if (NOT _ggml_sycl_pq2_xmx)
-        message(STATUS "GGML_SYCL_DEVICE_ARCH includes a device without 16-wide DPAS, not building the PQ2_0/PTQ1_0 XMX path")
+    if (NOT _ggml_sycl_pq2_xmx_16 AND NOT _ggml_sycl_pq2_xmx_8)
+        message(STATUS "GGML_SYCL_DEVICE_ARCH includes a device without XMX DPAS, not building the PQ2_0/PTQ1_0 XMX path")
         set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/pq2_xmx.cpp APPEND PROPERTY COMPILE_DEFINITIONS GGML_SYCL_NO_PQ2_XMX)
+    else()
+        message(STATUS "Building PQ2_0/PTQ1_0 XMX path (16-wide=${_ggml_sycl_pq2_xmx_16}, 8-wide=${_ggml_sycl_pq2_xmx_8})")
     endif()
 endif()
