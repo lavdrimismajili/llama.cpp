@@ -1,0 +1,2 @@
+4850:    // ARC-LAB: large prompt batches through oneDNN's int8 GEMM (faster than GemmMT there), GGML_SYCL_T2_W8A8_MIN (0 = off)
+4851:    static const int64_t w8a8_min = getenv("GGML_SYCL_T2_W8A8_MIN") ? atoll(getenv("GGML_SYCL_T2_W8A8_MIN")) : 0;

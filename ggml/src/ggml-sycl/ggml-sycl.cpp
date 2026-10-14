@@ -84,7 +84,11 @@
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
-#include "batched_mmq_ternary.hpp"
+#include "ggml-sycl/batched_mmq_ternary.hpp"
+#include "ggml-sycl/w8a8.hpp"
+#include <chrono>
+#include <map>
+#include <string>
 
 #define MEM_SIZE_2M	0x00200000
 #define MEM_SIZE_1G	0x40000000
@@ -124,6 +128,21 @@ static int ggml_sycl_dpas_exec_size(const sycl::device & device) {
     }
     return 0;
 }
+struct sycl_op_prof {
+    const bool enabled = getenv("GGML_SYCL_OP_PROF") != nullptr;
+    std::map<std::string, std::pair<double, int>> m;
+    ~sycl_op_prof() {
+        if (!enabled) return;
+        std::vector<std::pair<std::string, std::pair<double, int>>> v(m.begin(), m.end());
+        std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.first > b.second.first; });
+        double tot = 0; for (auto & e : v) tot += e.second.first;
+        fprintf(stderr, "\n[op prof] total %.1f ms\n", tot);
+        for (size_t i = 0; i < v.size() && i < 25; ++i)
+            fprintf(stderr, "  %-28s %9.1f ms (%4.1f%%) %6d calls\n", v[i].first.c_str(),
+                    v[i].second.first, 100.0 * v[i].second.first / tot, v[i].second.second);
+    }
+};
+static sycl_op_prof g_op_prof;
 
 static ggml_sycl_device_info ggml_sycl_init() {
     ggml_sycl_device_info info = {};
@@ -4644,6 +4663,20 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         ggml_sycl_op_fwht(ctx, src1, dst)) {
         return;
     }
+    // Large prompt batches: PTQ1_0/PQ2_0 weights go through oneDNN int8 GEMM,
+    // which reaches ~90% EU utilization vs ~30% for the pq2_xmx DPAS kernel.
+    // Must come before ggml_sycl_pq2_xmx_use, which locks the tensor into XMX layout on first use.
+    if ((src0->type == GGML_TYPE_PTQ1_0 || src0->type == GGML_TYPE_PQ2_0) &&
+    src1->ne[1] >= 1024 &&
+    src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+    ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+    if (ggml_sycl_w8a8_mul_mat_t2(ctx, src0->data, (const float *) src1->data,
+                                  src1->nb[1] / sizeof(float),
+                                  (float *) dst->data, src0->ne[1], src1->ne[1], src0->ne[0],
+                                  ctx.stream())) {
+        return;
+    }
+}
 
     if (ggml_sycl_pq2_xmx_use(ctx, src0, src1, dst)) {
         ggml_sycl_pq2_xmx_mul_mat(ctx, src0, src1, dst);
@@ -5217,7 +5250,7 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
+static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
     if (!g_sycl_loaded) return false;
 
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
@@ -5583,7 +5616,27 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     std::cerr << "Error OP "<<ggml_op_name(dst->op)<< std::endl;
     std::exit(1);
 }
+static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) {
+    if (!g_op_prof.enabled) {
+        return ggml_sycl_compute_forward_impl(ctx, dst);
+    }
+    ctx.stream()->wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = ggml_sycl_compute_forward_impl(ctx, dst);
+    ctx.stream()->wait();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
+    std::string key = ggml_op_name(dst->op);
+    if (dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_MUL_MAT_ID) {
+        key += std::string(":") + ggml_type_name(dst->src[0]->type);
+    } else if (dst->op == GGML_OP_UNARY) {
+        key += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(dst));
+    }
+    auto & e = g_op_prof.m[key];
+    e.first += ms;
+    e.second++;
+    return ok;
+}
 GGML_API void ggml_backend_sycl_get_device_description(int device, char *description,
                                       size_t description_size) try {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_description\n");

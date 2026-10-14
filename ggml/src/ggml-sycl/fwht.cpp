@@ -79,7 +79,30 @@ static void launch_fwht(const float * src, float * dst, const int64_t n_rows, co
                              fwht_kernel<N>(src, dst, n_rows, scale, item);
                          });
 }
-
+static void launch_fwht_slm1024(const float * src, float * dst, int64_t nblocks, float scale,
+                                dpct::queue_ptr stream) {
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sh(sycl::range<1>(1024), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(nblocks * 512, 512), [=](sycl::nd_item<1> it) {
+            const int64_t g = it.get_group(0);
+            const int     t = it.get_local_id(0);
+            const float * s = src + g * 1024;
+            float *       d = dst + g * 1024;
+            sh[t] = s[t] * scale;
+            sh[t + 512] = s[t + 512] * scale;
+            for (int h = 1; h < 1024; h <<= 1) {
+                it.barrier(sycl::access::fence_space::local_space);
+                const int   i = ((t & ~(h - 1)) << 1) | (t & (h - 1));
+                const float a = sh[i], b = sh[i + h];
+                sh[i] = a + b;
+                sh[i + h] = a - b;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            d[t] = sh[t];
+            d[t + 512] = sh[t + 512];
+        });
+    });
+}
 bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
@@ -112,6 +135,9 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
             return true;
         case 512:
             launch_fwht<512>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 1024:
+            launch_fwht_slm1024(src_d, dst_d, rows, scale, stream);
             return true;
         default:
             return false;
